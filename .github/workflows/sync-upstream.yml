@@ -1,0 +1,80 @@
+name: Sync upstream ytmusicapi
+
+# Runs daily to check for upstream updates.
+# When new commits are found, merges them and triggers a deploy webhook.
+
+on:
+  schedule:
+    - cron: '0 6 * * *'  # Daily at 6 AM UTC
+  workflow_dispatch:       # Manual trigger
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/sigma67/ytmusicapi.git || true
+          git fetch upstream main
+
+      - name: Check for new commits
+        id: check
+        run: |
+          BEHIND=$(git rev-list --count HEAD..upstream/main)
+          echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
+          echo "Upstream is $BEHIND commits ahead"
+
+      - name: Merge upstream
+        if: steps.check.outputs.behind != '0'
+        run: |
+          git merge upstream/main --no-edit || {
+            echo "Merge conflict detected — taking upstream version"
+            git checkout --theirs .
+            git add .
+            git commit --no-edit || true
+          }
+          git push origin main
+
+      - name: Trigger deploy webhook
+        if: steps.check.outputs.behind != '0'
+        env:
+          DEPLOY_WEBHOOK_URL: ${{ secrets.DEPLOY_WEBHOOK_URL }}
+        run: |
+          if [ -n "$DEPLOY_WEBHOOK_URL" ]; then
+            curl -s -X POST "$DEPLOY_WEBHOOK_URL" \
+              -H "Content-Type: application/json" \
+              -d "{\"source\":\"ytmusicapi-sync\",\"commits_synced\":\"${{ steps.check.outputs.behind }}\"}"
+            echo "Deploy webhook triggered"
+          else
+            echo "No DEPLOY_WEBHOOK_URL secret configured — skipping deploy trigger"
+          fi
+
+      - name: Notify on sync
+        if: steps.check.outputs.behind != '0'
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+        run: |
+          if [ -n "$RESEND_API_KEY" ]; then
+            curl -s -X POST "https://api.resend.com/emails" \
+              -H "Authorization: Bearer $RESEND_API_KEY" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"from\": \"alerts@trending.fm\",
+                \"to\": \"team@trending.fm\",
+                \"subject\": \"[Info] ytmusicapi synced ${{ steps.check.outputs.behind }} upstream commits\",
+                \"text\": \"The ytmusicapi fork has been synced with ${{ steps.check.outputs.behind }} new commits from upstream (sigma67/ytmusicapi).\\n\\nIf DEPLOY_WEBHOOK_URL is configured, a redeploy was triggered automatically.\\n\\n— trending.fm auto-sync\"
+              }"
+          fi
